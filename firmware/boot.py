@@ -9,9 +9,16 @@ MAX_FAILS = 3
 print("Bootloader starting")
 print("Version:", version.VERSION)
 
+
+# Option 2: Check for interrupt more frequently
 t0 = time.time()
 while time.time() - t0 < BOOT_GRACE:
-    time.sleep(0.2)
+    try:
+        time.sleep(0.5)
+    except KeyboardInterrupt:
+        import sys
+        sys.exit()
+
 
 fails = 0
 if BOOT_FLAG in uos.listdir():
