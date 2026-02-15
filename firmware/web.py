@@ -1,3 +1,4 @@
+# web.py
 import relay, uos
 
 def send(conn, path, ctype="text/html"):
