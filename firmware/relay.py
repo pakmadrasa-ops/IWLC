@@ -1,3 +1,4 @@
+# relay.py
 import time
 from machine import Pin
 from config import LED_PIN, RELAY_PIN, MIN_RELAY_INTERVAL
