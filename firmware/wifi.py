@@ -1,3 +1,4 @@
+# wifi.py
 import network, time, ujson
 from config import WIFI_FILE, AP_SSID, AP_PASSWORD
 
