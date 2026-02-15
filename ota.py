@@ -1,6 +1,7 @@
 import urequests, ujson, uos, version, machine
 
-BASE = "https://raw.githubusercontent.com/YOURUSER/esp-firmware/main/"
+BASE = "https://raw.githubusercontent.com/pakmadrasa-ops/IWLC/refs/heads/main/"
+
 
 def check_and_update():
     r = urequests.get(BASE+"manifest.json")
