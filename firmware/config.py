@@ -1,3 +1,4 @@
+# config.py
 LED_PIN = 2
 RELAY_PIN = 4
 MIN_RELAY_INTERVAL = 60
