@@ -1,0 +1,17 @@
+{
+  "version": "1.0.0",
+  "files": {
+    "boot.py": "firmware/boot.py",
+    "main.py": "firmware/main.py",
+    "config.py": "firmware/config.py",
+    "wifi.py": "firmware/wifi.py",
+    "relay.py": "firmware/relay.py",
+    "web.py": "firmware/web.py",
+    "ota.py": "firmware/ota.py",
+    "version.py": "firmware/version.py",
+    "www/index.html": "www/index.html",
+    "www/wifi.html": "www/wifi.html",
+    "www/update.html": "www/update.html",
+    "www/style.css": "www/style.css"
+  }
+}
