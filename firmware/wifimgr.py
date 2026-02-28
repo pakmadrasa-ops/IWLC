@@ -1,302 +1,250 @@
-#"github:tayfunulu/WiFiManager/wifimgr.py"
 import network
 import socket
 import ure
 import time
+import ujson
+import gc
 
-ap_ssid = "MotorSetup"
-ap_password = "12345678"
-ap_authmode = 3  # WPA2
+AP_SSID = "MotorSetup"
+AP_PASSWORD = "12345678"
+AP_AUTHMODE = 3  # WPA2
 
-NETWORK_PROFILES = 'wifi.dat'
+NETWORK_PROFILES = 'wifi.json'
+AP_TIMEOUT = 300  # seconds, AP mode auto-disable
+CONNECT_TIMEOUT = 15  # seconds
 
 wlan_ap = network.WLAN(network.AP_IF)
 wlan_sta = network.WLAN(network.STA_IF)
 
 server_socket = None
 
-
+# ==========================
+# WiFi connection functions
+# ==========================
 def get_connection():
-    """return a working WLAN(STA_IF) instance or None"""
-
-    # First check if there already is any connection:
+    """Return a connected STA interface or start AP for configuration"""
     if wlan_sta.isconnected():
         return wlan_sta
 
-    connected = False
-    try:
-        # ESP connecting to WiFi takes time, wait a bit and try again:
-        time.sleep(3)
-        if wlan_sta.isconnected():
-            return wlan_sta
+    # Try known networks first
+    profiles = read_profiles()
+    wlan_sta.active(True)
+    networks = wlan_sta.scan()
+    AUTHMODE = {0: "open", 1: "WEP", 2: "WPA-PSK", 3: "WPA2-PSK", 4: "WPA/WPA2-PSK"}
 
-        # Read known network profiles from file
-        profiles = read_profiles()
+    for ssid_bytes, bssid, channel, rssi, authmode, hidden in sorted(networks, key=lambda x: x[3], reverse=True):
+        ssid = ssid_bytes.decode('utf-8')
+        encrypted = authmode > 0
+        print("ssid: {} chan: {} rssi: {} authmode: {}".format(ssid, channel, rssi, AUTHMODE.get(authmode, '?')))
+        if encrypted:
+            if ssid in profiles:
+                password = profiles[ssid]
+                if do_connect(ssid, password):
+                    return wlan_sta
+        else:
+            if do_connect(ssid, None):
+                return wlan_sta
 
-        # Search WiFis in range
-        wlan_sta.active(True)
-        networks = wlan_sta.scan()
+    # If no network connected, start AP mode
+    if start_ap():
+        return wlan_sta if wlan_sta.isconnected() else None
+    return None
 
-        AUTHMODE = {0: "open", 1: "WEP", 2: "WPA-PSK", 3: "WPA2-PSK", 4: "WPA/WPA2-PSK"}
-        for ssid, bssid, channel, rssi, authmode, hidden in sorted(networks, key=lambda x: x[3], reverse=True):
-            ssid = ssid.decode('utf-8')
-            encrypted = authmode > 0
-            print("ssid: %s chan: %d rssi: %d authmode: %s" % (ssid, channel, rssi, AUTHMODE.get(authmode, '?')))
-            if encrypted:
-                if ssid in profiles:
-                    password = profiles[ssid]
-                    connected = do_connect(ssid, password)
-                else:
-                    print("skipping unknown encrypted network")
-            else:  # open
-                connected = do_connect(ssid, None)
-            if connected:
-                break
-
-    except OSError as e:
-        print("exception", str(e))
-
-    # start web server for connection manager:
-    if not connected:
-        connected = start()
-
-    return wlan_sta if connected else None
-
-
-def read_profiles():
-    with open(NETWORK_PROFILES) as f:
-        lines = f.readlines()
-    profiles = {}
-    for line in lines:
-        ssid, password = line.strip("\n").split(";")
-        profiles[ssid] = password
-    return profiles
-
-
-def write_profiles(profiles):
-    lines = []
-    for ssid, password in profiles.items():
-        lines.append("%s;%s\n" % (ssid, password))
-    with open(NETWORK_PROFILES, "w") as f:
-        f.write(''.join(lines))
-
-
-def do_connect(ssid, password):
+def do_connect(ssid, password, timeout=CONNECT_TIMEOUT):
     wlan_sta.active(True)
     if wlan_sta.isconnected():
-        return None
-    print('Trying to connect to %s...' % ssid)
+        return True
+    print("Trying to connect to '{}'...".format(ssid))
     wlan_sta.connect(ssid, password)
-    for retry in range(200):
-        connected = wlan_sta.isconnected()
-        if connected:
-            break
-        time.sleep(0.1)
+    start = time.time()
+    while (time.time() - start) < timeout:
+        if wlan_sta.isconnected():
+            print("Connected. Network config:", wlan_sta.ifconfig())
+            return True
+        time.sleep(0.2)
         print('.', end='')
-    if connected:
-        print('\nConnected. Network config: ', wlan_sta.ifconfig())
-        
-    else:
-        print('\nFailed. Not Connected to: ' + ssid)
-    return connected
+    print("\nFailed to connect to '{}'".format(ssid))
+    return False
 
+# ==========================
+# Profiles read/write
+# ==========================
+def read_profiles():
+    try:
+        with open(NETWORK_PROFILES, "r") as f:
+            return ujson.load(f)
+    except (OSError, ValueError):
+        return {}
 
-def send_header(client, status_code=200, content_length=None ):
+def write_profiles(profiles):
+    try:
+        with open(NETWORK_PROFILES, "w") as f:
+            ujson.dump(profiles, f)
+    except OSError as e:
+        print("Error writing profiles:", e)
+
+# ==========================
+# HTTP response helpers
+# ==========================
+def send_header(client, status_code=200, content_length=None):
     client.sendall("HTTP/1.0 {} OK\r\n".format(status_code))
     client.sendall("Content-Type: text/html\r\n")
     if content_length is not None:
-      client.sendall("Content-Length: {}\r\n".format(content_length))
+        client.sendall("Content-Length: {}\r\n".format(content_length))
     client.sendall("\r\n")
 
-
 def send_response(client, payload, status_code=200):
-    content_length = len(payload)
-    send_header(client, status_code, content_length)
-    if content_length > 0:
-        client.sendall(payload)
-    client.close()
-
-
-def handle_root(client):
-    wlan_sta.active(True)
-    ssids = sorted(ssid.decode('utf-8') for ssid, *_ in wlan_sta.scan())
-    send_header(client)
-    client.sendall("""\
-        <html>
-            <h1> Wi-Fi Client Setup </h1>
-            <form action="configure" method="post">
-                <table>
-                    <tbody>
-    """)
-    while len(ssids):
-        ssid = ssids.pop(0)
-        client.sendall("""\
-            <tr><td colspan="2">
-                        <input type="radio" name="ssid" value="{0}" />{0}
-            </td></tr>
-        """.format(ssid))
-    client.sendall("""\
-            <tr><td>Password:</td>
-                        <td><input name="password" type="text" /></td>
-            </tr></tbody></table>
-                <p> <input type="submit" value="Submit" /></p>
-            </form>
-            <br><br><hr />
-            <h5>    Your ssid and password information will be saved into the
-                    "%(filename)s" file in your ESP module for future usage.
-                    Be careful about security!
-            </h5>
-        </html>
-    """ % dict(filename=NETWORK_PROFILES))
+    if isinstance(payload, str):
+        payload = payload.encode('utf-8')
+    send_header(client, status_code, len(payload))
+    client.sendall(payload)
     client.close()
 
 def unquote(s):
     res = s.split('%')
     for i in range(1, len(res)):
-        item = res[i]
         try:
-            res[i] = chr(int(item[:2], 16)) + item[2:]
+            res[i] = chr(int(res[i][:2], 16)) + res[i][2:]
         except ValueError:
-            res[i] = '%' + item
+            res[i] = '%' + res[i]
     return "".join(res)
 
+# ==========================
+# HTTP handlers
+# ==========================
+def handle_root(client):
+    wlan_sta.active(True)
+    ssids = sorted(ssid.decode('utf-8') for ssid, *_ in wlan_sta.scan())
+    html = ["<html><h1>Wi-Fi Client Setup</h1><form action='configure' method='post'><table>"]
+    for ssid in ssids:
+        html.append('<tr><td colspan="2"><input type="radio" name="ssid" value="{0}">{0}</td></tr>'.format(ssid))
+    html.append("""
+        <tr><td>Password:</td><td><input name="password" type="text" /></td></tr>
+        </table>
+        <p><input type="submit" value="Submit" /></p>
+        </form>
+        <hr />
+        <h5>Your ssid and password information will be saved into the '{}' file in your ESP module. Be careful!</h5>
+        </html>
+    """.format(NETWORK_PROFILES))
+    send_response(client, ''.join(html))
+
 def handle_configure(client, request):
-    match = ure.search("ssid=([^&]*)&password=(.*)", request)
-
+    match = ure.search("ssid=([^&]*)&password=(.*)", request.decode('utf-8'))
     if match is None:
-        send_response(client, "Parameters not found", status_code=400)
+        send_response(client, "Parameters not found", 400)
         return False
-    try:
-        raw_ssid = match.group(1).decode("utf-8")
-        ssid = unquote(raw_ssid)
-        raw_password = match.group(2).decode("utf-8")
-        password = unquote(raw_password)
+    ssid = unquote(match.group(1))
+    password = unquote(match.group(2))
 
-    except Exception:
-        #ssid = match.group(1).replace("%3F", "?").replace("%21", "!")
-        raw_ssid = match.group(1).decode("utf-8")
-        ssid = unquote(raw_ssid)
-        raw_password = match.group(2).decode("utf-8")
-        password = unquote(raw_password)
-
-    if len(ssid) == 0:
-        send_response(client, "SSID must be provided", status_code=400)
+    if not ssid:
+        send_response(client, "SSID must be provided", 400)
         return False
-
 
     if do_connect(ssid, password):
-        response = """\
-            <html>
-                <center>
-                    <br><br>
-                    <h1"> ESP successfully connected to WiFi network %(ssid)s.</h1>
-                    <br><br>
-                </center>
-            </html>
-        """ % dict(ssid=ssid)
-        send_response(client, response)
-        time.sleep(1)
+        html = "<html><center><h1>ESP successfully connected to WiFi network {}</h1></center></html>".format(ssid)
+        send_response(client, html)
         wlan_ap.active(False)
-        try:
-            profiles = read_profiles()
-        except OSError:
-            profiles = {}
+        profiles = read_profiles()
         profiles[ssid] = password
         write_profiles(profiles)
-
-        time.sleep(5)
-
+        time.sleep(2)
         return True
     else:
-        response = """\
-            <html>
-                <center>
-                    <h1>ESP could not connect to WiFi network %(ssid)s. </h1>
-                    <br><br>
-                    <form>
-                        <input type="button" value="Go back!" onclick="history.back()"></input>
-                    </form>
-                </center>
-            </html>
-        """ % dict(ssid=ssid)
-        send_response(client, response)
+        html = "<html><center><h1>ESP could not connect to WiFi network {}</h1><br><form><input type='button' value='Go back!' onclick='history.back()'></form></center></html>".format(ssid)
+        send_response(client, html)
         return False
 
-
 def handle_not_found(client, url):
-    send_response(client, "Path not found: {}".format(url), status_code=404)
+    send_response(client, "Path not found: {}".format(url), 404)
 
-
+# ==========================
+# AP server
+# ==========================
 def stop():
     global server_socket
-
     if server_socket:
         server_socket.close()
         server_socket = None
+    wlan_ap.active(False)
 
+import uos
 
-def start(port=80):
-    global server_socket
+# ==========================
+# WiFi reset
+# ==========================
+def reset_wifi():
+    """Delete stored WiFi credentials and disconnect"""
+    global wlan_sta, wlan_ap
 
-    addr = socket.getaddrinfo('0.0.0.0', port)[0][-1]
+    # Delete credentials file
+    try:
+        uos.remove(NETWORK_PROFILES)
+        print("Deleted WiFi credentials file '{}'".format(NETWORK_PROFILES))
+    except OSError:
+        print("WiFi credentials file not found. Nothing to delete.")
 
-    stop()
+    # Disconnect STA
+    if wlan_sta.isconnected():
+        wlan_sta.disconnect()
+        print("Disconnected from WiFi network.")
+    wlan_sta.active(False)
 
+    # Disable AP if active
+    if wlan_ap.active():
+        wlan_ap.active(False)
+        print("AP mode disabled.")
+
+    # Clear cached networks (ESP8266/ESP32 stores networks in memory on restart)
     wlan_sta.active(True)
+    wlan_sta.disconnect()
+    wlan_sta.active(False)
+    print("WiFi reset completed.")
+    
+def start_ap(port=80, timeout=AP_TIMEOUT):
+    global server_socket
+    addr = socket.getaddrinfo('0.0.0.0', port)[0][-1]
+    stop()
     wlan_ap.active(True)
-
-    wlan_ap.config(essid=ap_ssid, password=ap_password)
-
+    wlan_ap.config(essid=AP_SSID, password=AP_PASSWORD)
     server_socket = socket.socket()
     server_socket.bind(addr)
     server_socket.listen(1)
+    print("AP mode active. Connect to SSID '{}', password '{}'".format(AP_SSID, AP_PASSWORD))
+    start_time = time.time()
 
-    print('Connect to WiFi ssid ' + ap_ssid + ', default password: ' + ap_password)
-    print('and access the ESP via your favorite web browser at 192.168.4.1.')
-    print('Listening on:', addr)
-
-    while True:
+    while (time.time() - start_time) < timeout:
         if wlan_sta.isconnected():
-            wlan_ap.active(False)
+            print("STA connected. Stopping AP mode.")
+            stop()
             return True
-
-        client, addr = server_socket.accept()
-        print('client connected from', addr)
         try:
-            client.settimeout(5.0)
-
-            request = b""
-            try:
-                while "\r\n\r\n" not in request:
-                    request += client.recv(512)
-            except OSError:
-                pass
-
-            # Handle form data from Safari on macOS and iOS; it sends \r\n\r\nssid=<ssid>&password=<password>
-            try:
-                request += client.recv(1024)
-                print("Received form data after \\r\\n\\r\\n(i.e. from Safari on macOS or iOS)")
-            except OSError:
-                pass
-
-            print("Request is: {}".format(request))
-            if "HTTP" not in request:  # skip invalid requests
-                continue
-
-            # version 1.9 compatibility
-            try:
-                url = ure.search("(?:GET|POST) /(.*?)(?:\\?.*?)? HTTP", request).group(1).decode("utf-8").rstrip("/")
-            except Exception:
-                url = ure.search("(?:GET|POST) /(.*?)(?:\\?.*?)? HTTP", request).group(1).rstrip("/")
-            print("URL is {}".format(url))
-
-            if url == "":
-                handle_root(client)
-            elif url == "configure":
-                handle_configure(client, request)
-            else:
-                handle_not_found(client, url)
-
+            client, addr = server_socket.accept()
+            handle_client(client)
+        except Exception as e:
+            print("Client handling error:", e)
         finally:
-            client.close()
+            gc.collect()
+    print("AP mode timeout.")
+    stop()
+    return False
 
+def handle_client(client):
+    try:
+        request = client.recv(1024)
+        if not request:
+            client.close()
+            return
+        try:
+            url = ure.search("(?:GET|POST) /(.*?)(?:\\?.*?)? HTTP", request.decode('utf-8')).group(1).rstrip("/")
+        except Exception:
+            url = ""
+        if url == "":
+            handle_root(client)
+        elif url == "configure":
+            handle_configure(client, request)
+        else:
+            handle_not_found(client, url)
+    except Exception as e:
+        print("Error in client:", e)
+        client.close()
